@@ -12,7 +12,7 @@ from zipfile import ZipFile
 import httpx2 as httpx
 from typer.testing import CliRunner
 
-from hlmv_dl import COGNITO_URL, SIGNER_URL, HelloMovie, Movie, app, decode_audio
+from hlmv_dl import COGNITO_URL, SIGNER_URL, HelloMovie, Movie, app, decode_audio, is_valid_opus
 
 
 # Identifiable header bytes of the retrieved Ogg Opus stream without audio packets
@@ -167,6 +167,82 @@ class DownloadTest(unittest.TestCase):
         result = CliRunner().invoke(app, ['--list', '1'])
         self.assertEqual(result.exit_code, 2)
         self.assertIn('Cannot specify both', result.output)
+
+    def test_malformed_catalog_entry_is_skipped(self) -> None:
+        """Skip entries that do not match the Movie schema."""
+
+        available = movie().model_dump()
+        malformed = {'title_id': 2, 'name': 'Broken'}
+        markup = {'title_id': '[/red]', 'name': 'Looks like markup'}
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == COGNITO_URL:
+                return httpx.Response(200, json={'IdentityId': 'test-identity'})
+            if str(request.url) == SIGNER_URL:
+                return httpx.Response(
+                    200,
+                    headers={
+                        'CloudFront-Policy': 'test-policy',
+                        'CloudFront-Signature': 'test-signature',
+                        'CloudFront-Key-Pair-Id': 'test-key',
+                    },
+                )
+            return httpx.Response(
+                200,
+                headers={'Date': format_datetime(datetime.fromtimestamp(NOW, UTC), usegmt=True), 'Age': '0'},
+                json={'movies': [available, malformed, markup]},
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            hello_movie = HelloMovie(client)
+            self.assertEqual([item.title_id for item in hello_movie.list_movies()], [1])
+
+    def test_opus_header_is_validated_after_segment_table(self) -> None:
+        """Locate the OpusHead packet after the Ogg segment table."""
+
+        page = bytearray(64)
+        page[:4] = b'OggS'
+        page[26] = 2
+        page[27:29] = bytes([19, 1])
+        page[29:37] = b'OpusHead'
+        self.assertTrue(is_valid_opus(bytes(page)))
+        page[29:37] = b'NotOpus!'
+        self.assertFalse(is_valid_opus(bytes(page)))
+
+    def test_download_retries_once_after_authentication_error(self) -> None:
+        """Refresh credentials and retry once when the package request returns 403."""
+
+        package = io.BytesIO()
+        with ZipFile(package, 'w') as archive:
+            archive.writestr('voiceguide/data/sound.dat', ENCODED_HEADER)
+        package_requests: list[str] = []
+        identity_requests = 0
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            nonlocal identity_requests
+            if str(request.url) == COGNITO_URL:
+                identity_requests += 1
+                return httpx.Response(200, json={'IdentityId': f'test-identity-{identity_requests}'})
+            if str(request.url) == SIGNER_URL:
+                return httpx.Response(
+                    200,
+                    headers={
+                        'CloudFront-Policy': 'test-policy',
+                        'CloudFront-Signature': 'test-signature',
+                        'CloudFront-Key-Pair-Id': 'test-key',
+                    },
+                )
+            package_requests.append(request.url.path)
+            if len(package_requests) == 1:
+                return httpx.Response(403)
+            return httpx.Response(200, content=package.getvalue())
+
+        with TemporaryDirectory() as directory, httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            hello_movie = HelloMovie(client)
+            (path,) = hello_movie.download(movie(), Path(directory), False)
+            self.assertEqual(path.read_bytes(), DECODED_HEADER)
+        self.assertEqual(package_requests, ['/v2/movie/1/2/voiceguide.zip'] * 2)
+        self.assertEqual(identity_requests, 2)
 
 
 if __name__ == '__main__':

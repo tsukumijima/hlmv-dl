@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 import time
@@ -5,12 +6,12 @@ import zlib
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from tempfile import TemporaryFile
-from typing import Annotated
+from typing import Annotated, Any, BinaryIO
 from zipfile import BadZipFile, ZipFile
 
 import httpx2 as httpx
 import typer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from rich.console import Console
 from rich.progress import DownloadColumn, Progress, SpinnerColumn, TextColumn, TransferSpeedColumn
 
@@ -48,10 +49,33 @@ class Movie(BaseModel):
     external_bucket: str
 
 
-class Catalog(BaseModel):
-    """Catalog of titles returned by the distribution server."""
+def parse_catalog(content: bytes) -> list[Movie]:
+    """
+    Parse the catalog payload and skip entries that do not match the expected schema.
 
-    movies: list[Movie]
+    Args:
+        content (bytes): Raw JSON response from the catalog endpoint
+
+    Returns:
+        list[Movie]: Valid titles in the order returned by the server
+    """
+
+    payload: Any = json.loads(content)
+    if not isinstance(payload, dict):
+        raise ValueError('Unexpected catalog format.')
+    entries = payload.get('movies')
+    if not isinstance(entries, list):
+        raise ValueError('The catalog does not contain a movie list.')
+    adapter: TypeAdapter[Movie] = TypeAdapter(Movie)
+    movies: list[Movie] = []
+    for entry in entries:
+        try:
+            movies.append(adapter.validate_python(entry))
+        except ValidationError:
+            title_id = entry.get('title_id', 'unknown') if isinstance(entry, dict) else 'unknown'
+            # title_id comes from the server, so never let Rich interpret it as markup.
+            console.print(f'Skipping a malformed catalog entry: {title_id}', markup=False, style='yellow')
+    return movies
 
 
 class HelloMovie:
@@ -108,12 +132,12 @@ class HelloMovie:
         self.authenticate()
         response = self.client.get(f'{BASE_URL}/v2/movie/movies.json')
         response.raise_for_status()
-        catalog = Catalog.model_validate_json(response.content)
+        movies = parse_catalog(response.content)
         now = parsedate_to_datetime(response.headers['Date']).timestamp() + int(response.headers.get('Age', '0'))
         return sorted(
             (
                 movie
-                for movie in catalog.movies
+                for movie in movies
                 if movie.contenttype == 2
                 and movie.status_info >= 1
                 and movie.voiceguide_version > 0
@@ -123,6 +147,33 @@ class HelloMovie:
             key=lambda movie: (movie.movie_start, movie.title_id),
             reverse=True,
         )
+
+    def _stream_package(self, url: str, package: BinaryIO) -> None:
+        """
+        Download an audio package into an open temporary file while showing progress.
+
+        Args:
+            url (str): Package URL
+            package (BinaryIO): Destination temporary file
+        """
+
+        with (
+            self.client.stream('GET', url) as response,
+            Progress(
+                SpinnerColumn(),
+                TextColumn('{task.description}'),
+                DownloadColumn(),
+                TransferSpeedColumn(),
+                console=console,
+                disable=console.is_terminal is False,
+            ) as progress,
+        ):
+            response.raise_for_status()
+            total = int(response.headers['Content-Length']) if 'Content-Length' in response.headers else None
+            task = progress.add_task('Downloading', total=total)
+            for chunk in response.iter_bytes():
+                package.write(chunk)
+                progress.update(task, advance=len(chunk))
 
     def download(self, movie: Movie, output: Path, keep_package: bool) -> list[Path]:
         """
@@ -154,25 +205,20 @@ class HelloMovie:
             'hellomovie-app-deluxe-demo': 'deluxe',
         }.get(movie.external_bucket, 'movie')
         url = f'{BASE_URL}/{prefix}/{movie.title_id}/{movie.voiceguide_version}/voiceguide.zip'
-        self.authenticate()
         with TemporaryFile() as package:
-            with (
-                self.client.stream('GET', url) as response,
-                Progress(
-                    SpinnerColumn(),
-                    TextColumn('{task.description}'),
-                    DownloadColumn(),
-                    TransferSpeedColumn(),
-                    console=console,
-                    disable=console.is_terminal is False,
-                ) as progress,
-            ):
-                response.raise_for_status()
-                total = int(response.headers['Content-Length']) if 'Content-Length' in response.headers else None
-                task = progress.add_task('Downloading', total=total)
-                for chunk in response.iter_bytes():
-                    package.write(chunk)
-                    progress.update(task, advance=len(chunk))
+            for attempt in range(2):
+                try:
+                    self.authenticate()
+                    self._stream_package(url, package)
+                    break
+                except httpx.HTTPStatusError as ex:
+                    if attempt == 0 and ex.response.status_code in (401, 403):
+                        # Signed cookies may have expired between downloads; refresh and retry once.
+                        self.authenticated_until = 0.0
+                        package.seek(0)
+                        package.truncate()
+                        continue
+                    raise
             package.seek(0)
             with ZipFile(package) as archive:
                 # Read audio payload directly without extracting the entire archive
@@ -192,6 +238,24 @@ class HelloMovie:
                 with metadata_path.open('x', encoding='utf-8') as metadata_file:
                     metadata_file.write(movie.model_dump_json(indent=2) + '\n')
         return list(audio_files)
+
+
+def is_valid_opus(data: bytes) -> bool:
+    """
+    Check that the payload starts with an Ogg page whose first packet is an OpusHead header.
+
+    Args:
+        data (bytes): Decoded audio payload
+
+    Returns:
+        bool: True when the payload looks like an Ogg Opus stream
+    """
+
+    if len(data) < 27 or data[:4] != b'OggS':
+        return False
+    segment_count = data[26]
+    packet_start = 27 + segment_count
+    return len(data) >= packet_start + 8 and data[packet_start : packet_start + 8] == b'OpusHead'
 
 
 def decode_audio(encoded: bytes, token: int) -> bytes:
@@ -220,7 +284,7 @@ def decode_audio(encoded: bytes, token: int) -> bytes:
         states = [y, z, w, value]
         key.append(int(1.0 + (float(value) * 253.0) * (2.0**-64)))
     decoded = bytes(value ^ key[index % 2048] for index, value in enumerate(encoded))
-    if decoded[:4] != b'OggS' or decoded[28:36] != b'OpusHead':
+    if is_valid_opus(decoded) is False:
         raise RuntimeError('Failed to restore Ogg Opus stream. Please verify the source format.')
     return decoded
 
