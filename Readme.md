@@ -172,6 +172,22 @@ This saves the following files in the output directory:
 3. **`<Title> [<ID>].zip`**: Original distribution archive containing the raw encrypted payload and synchronization data.
 4. **`<Title> [<ID>].info.json`**: Formatted JSON file containing metadata returned by the catalog API (dates, bucket identifiers, tokens, etc.).
 
+### Step 5: Restoring Audio from a Saved Package (`--decode`)
+
+Titles leave the catalog once their screening period ends, and after that they can no
+longer be downloaded. A package saved with `--keep-package` still contains everything
+needed to restore the audio, because the metadata JSON next to it holds the token.
+
+Use `--decode` to restore the Opus tracks from such a package:
+
+```bash
+hlmv-dl --decode "./downloads/<Title> [<ID>].zip"
+```
+
+The token is read from the `<Title> [<ID>].info.json` file beside the package. Pass
+`--token` to supply it yourself when the metadata file is gone. The server is not
+contacted at all, so this works for titles that are no longer listed.
+
 ## Command-Line Reference
 
 ```text
@@ -191,6 +207,8 @@ Usage: hlmv-dl [OPTIONS] [TITLE_IDS]...
 | `--list` | | List currently available audio titles and IDs | `False` |
 | `--output` | `-o` | Destination directory for downloaded files | `.` (current dir) |
 | `--keep-package` | | Also save the original package ZIP and metadata JSON | `False` |
+| `--decode` | | Restore Opus files from a package saved with `--keep-package` | |
+| `--token` | | Title token used by `--decode` (read from the metadata JSON when omitted) | |
 | `--help` | | Show command help and exit | |
 
 ## Troubleshooting

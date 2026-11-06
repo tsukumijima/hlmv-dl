@@ -289,17 +289,72 @@ def decode_audio(encoded: bytes, token: int) -> bytes:
     return decoded
 
 
+def decode_package(package: Path, token: int, output: Path) -> list[Path]:
+    """
+    Restore Opus files from a package that was saved with --keep-package.
+
+    Args:
+        package (Path): Package ZIP saved with --keep-package
+        token (int): Title token used to decode the payload
+        output (Path): Destination directory
+
+    Returns:
+        list[Path]: Paths to the restored Opus files, with the main track first
+    """
+
+    stem = package.stem
+    with ZipFile(package) as archive:
+        names = archive.namelist()
+        if 'voiceguide/data/sound.dat' not in names:
+            raise RuntimeError('The package does not contain the main audio track.')
+        audio_files = {output / f'{stem}.opus': decode_audio(archive.read('voiceguide/data/sound.dat'), token)}
+        if 'voiceguide/data/waiting.dat' in names:
+            audio_files[output / f'{stem}.waiting.opus'] = decode_audio(
+                archive.read('voiceguide/data/waiting.dat'), token
+            )
+    output.mkdir(parents=True, exist_ok=True)
+    for path, audio in audio_files.items():
+        with path.open('xb') as audio_file:
+            audio_file.write(audio)
+    return list(audio_files)
+
+
 @app.command()
 def download(
     title_ids: Annotated[list[int] | None, typer.Argument(help='Title IDs displayed in --list (multiple allowed)')] = None,
     list_titles: Annotated[bool, typer.Option('--list', help='List available audio titles and IDs')] = False,
-    output: Annotated[Path, typer.Option('--output', '-o', help='Output directory for downloaded files')] = Path('.'),
+    output: Annotated[
+        Path | None, typer.Option('--output', '-o', help='Output directory for downloaded files')
+    ] = None,
     keep_package: Annotated[
         bool, typer.Option('--keep-package', help='Also save the original package ZIP and metadata JSON')
     ] = False,
+    decode_package_path: Annotated[
+        Path | None,
+        typer.Option(
+            '--decode',
+            help='Restore Opus files from a package saved with --keep-package instead of downloading',
+        ),
+    ] = None,
+    token: Annotated[
+        int | None, typer.Option('--token', help='Title token for --decode (read from the metadata JSON when omitted)')
+    ] = None,
 ) -> None:
     """Download audio guides and commentaries from HELLO! MOVIE and save as Opus."""
 
+    if decode_package_path is not None:
+        if title_ids or list_titles is True:
+            raise typer.BadParameter('Cannot specify --decode together with title IDs or --list.')
+        info_path = decode_package_path.with_suffix('.info.json')
+        if token is None:
+            if info_path.exists() is False:
+                raise typer.BadParameter(
+                    f'Token not found. Pass --token or keep {info_path.name} beside the package.'
+                )
+            token = int(json.loads(info_path.read_text(encoding='utf-8'))['token'])
+        for path in decode_package(decode_package_path, token, output if output is not None else decode_package_path.parent):
+            console.print(f'Saved: {path.resolve()}', markup=False, soft_wrap=True)
+        return
     if list_titles is True and title_ids:
         raise typer.BadParameter('Cannot specify both --list and title IDs.')
     if list_titles is False and not title_ids:
@@ -323,7 +378,7 @@ def download(
             selected.append(movie)
         for movie in selected:
             console.print(f'{movie.name} / {movie.lang_name} / ID: {movie.title_id}', markup=False, soft_wrap=True)
-            for path in hello_movie.download(movie, output, keep_package):
+            for path in hello_movie.download(movie, output if output is not None else Path('.'), keep_package):
                 console.print(f'Saved: {path.resolve()}', markup=False, soft_wrap=True)
 
 

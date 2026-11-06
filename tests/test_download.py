@@ -168,6 +168,71 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(result.exit_code, 2)
         self.assertIn('Cannot specify both', result.output)
 
+    def test_decode_restores_saved_package_without_server(self) -> None:
+        """Restore Opus files from a package whose title has already left the catalog."""
+
+        encoded_waiting_header = bytes.fromhex(
+            '4e66665201030101ed5ada76449aa2c2b11e137a746311e2218c35ce43a03fe86fbecdd6b0a6091d3990fa5ff015f9'
+        )
+        decoded_waiting_header = bytes.fromhex(
+            '4f6767530002000000000000000090f2b62700000000fc49178701134f707573486561640102380180bb0000000000'
+        )
+        package = io.BytesIO()
+        with ZipFile(package, 'w') as archive:
+            archive.writestr('voiceguide/data/sound.dat', ENCODED_HEADER)
+            archive.writestr('voiceguide/data/waiting.dat', encoded_waiting_header)
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory)
+            package_path = output / 'Sample Title [1].zip'
+            package_path.write_bytes(package.getvalue())
+            package_path.with_suffix('.info.json').write_text(movie().model_dump_json(indent=2) + '\n', encoding='utf-8')
+            result = CliRunner().invoke(app, ['--decode', str(package_path)])
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual((output / 'Sample Title [1].opus').read_bytes(), DECODED_HEADER)
+            self.assertEqual((output / 'Sample Title [1].waiting.opus').read_bytes(), decoded_waiting_header)
+
+    def test_decode_uses_explicit_token_without_metadata(self) -> None:
+        """Accept a token given on the command line when the metadata JSON is gone."""
+
+        package = io.BytesIO()
+        with ZipFile(package, 'w') as archive:
+            archive.writestr('voiceguide/data/sound.dat', ENCODED_HEADER)
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory)
+            package_path = output / 'Sample Title [1].zip'
+            package_path.write_bytes(package.getvalue())
+            result = CliRunner().invoke(app, ['--decode', str(package_path), '--token', str(TOKEN)])
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual((output / 'Sample Title [1].opus').read_bytes(), DECODED_HEADER)
+
+    def test_decode_without_token_fails_before_writing(self) -> None:
+        """Report a missing token instead of writing broken files."""
+
+        package = io.BytesIO()
+        with ZipFile(package, 'w') as archive:
+            archive.writestr('voiceguide/data/sound.dat', ENCODED_HEADER)
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory)
+            package_path = output / 'Sample Title [1].zip'
+            package_path.write_bytes(package.getvalue())
+            result = CliRunner().invoke(app, ['--decode', str(package_path)])
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn('Token not found', result.output)
+            self.assertFalse((output / 'Sample Title [1].opus').exists())
+
+    def test_decode_cannot_be_combined_with_download_arguments(self) -> None:
+        """Reject --decode together with title IDs or --list."""
+
+        with TemporaryDirectory() as directory:
+            package_path = Path(directory) / 'Sample Title [1].zip'
+            package_path.write_bytes(b'')
+            result = CliRunner().invoke(app, ['--decode', str(package_path), '--list'])
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn('Cannot specify --decode', result.output)
+
     def test_malformed_catalog_entry_is_skipped(self) -> None:
         """Skip entries that do not match the Movie schema."""
 
